@@ -1,0 +1,795 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# ufifmt  -  UFI floppy formatter
+#
+# Copyright (C) 2026 Kazuhiro Hayashi <tedi@tedi.sakura.ne.jp>
+#   Python rewrite; originally written in C as ufiformat (GPL-2.0-or-later),
+#   Copyright (C) 2005-2011 Kazuhiro Hayashi <tedi@tedi.sakura.ne.jp>
+#   Copyright (C) 2005 John Floyd <jfloyd@bigpond.net.au>
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, see <https://www.gnu.org/licenses/>.
+
+"""
+ufifmt  -  UFI floppy formatter
+
+Requires:
+    pip install pyusb
+    libusb 1.0  (brew install libusb  /  apt install libusb-1.0-0)
+
+macOS note:
+    Before running, eject the floppy disk in Finder (or: diskutil eject /dev/diskN).
+    This releases the IOKit driver so libusb can claim the interface.
+
+Linux note:
+    The kernel USB mass-storage driver is detached automatically.
+    You may need to run as root, or add a udev rule granting access.
+    Installing pyudev (pip install pyudev) and libudev enables device
+    path arguments such as /dev/sdb or /dev/sg1.
+"""
+
+import sys
+import os
+import stat as _stat
+import platform
+from typing import NamedTuple
+import usb.core
+import usb.util
+import argparse
+
+__version__ = "0.9.0"
+
+try:
+    import pyudev
+    _PYUDEV_AVAILABLE = True
+except ImportError:
+    _PYUDEV_AVAILABLE = False
+
+# ---------------------------------------------------------------------------
+# UFI status codes
+# ---------------------------------------------------------------------------
+
+UFI_GOOD              = 0
+UFI_ERROR             = -1
+UFI_UNFORMATTED_MEDIA = 1
+UFI_FORMATTED_MEDIA   = 2
+UFI_NO_MEDIA          = 3
+UFI_PROTECTED         = 1
+UFI_NOT_PROTECTED     = 0
+
+# ---------------------------------------------------------------------------
+# USB interface class codes
+# ---------------------------------------------------------------------------
+
+USB_CLASS_MASS_STORAGE = 0x08
+USB_SUBCLASS_UFI       = 0x04
+USB_PROTOCOL_CBI       = 0x00
+
+# ---------------------------------------------------------------------------
+# CBI transport direction flags
+# ---------------------------------------------------------------------------
+
+CBW_FLAG_IN  = 0x80
+CBW_FLAG_OUT = 0x00
+
+TIMEOUT_MS = 10_000
+
+# ---------------------------------------------------------------------------
+# UFI CDB templates (12-byte)
+# ---------------------------------------------------------------------------
+
+CDB_TEST_UNIT_READY = bytes([
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+])
+
+CDB_READ_FORMAT_CAPACITIES = bytes([
+    0x23, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x34, 0x00, 0x00, 0x00,
+])
+_READ_FORMAT_CAPACITIES_DATA_LEN = CDB_READ_FORMAT_CAPACITIES[8]
+
+CDB_INQUIRY = bytes([
+    0x12, 0x00, 0x00, 0x00, 0x24, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+])
+_INQUIRY_DATA_LEN = CDB_INQUIRY[4]
+
+CDB_MODE_SENSE = bytes([
+    0x5A, 0x00, 0x05, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x28, 0x00, 0x00, 0x00,
+])
+_MODE_SENSE_DATA_LEN = CDB_MODE_SENSE[8]
+
+CDB_REQUEST_SENSE = bytes([
+    0x03, 0x00, 0x00, 0x00, 0x12, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+])
+_REQUEST_SENSE_DATA_LEN = CDB_REQUEST_SENSE[4]
+
+CDB_FORMAT_UNIT_BASE = bytes([
+    0x04, 0x17, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x0C, 0x00, 0x00, 0x00,
+])
+
+FORMAT_UNIT_DATA_BASE = bytes([
+    0x00, 0xB0, 0x00, 0x08, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+])
+
+CDB_READ10_BASE = bytes([
+    0x28, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+])
+
+# ---------------------------------------------------------------------------
+# Data types
+# ---------------------------------------------------------------------------
+
+class Geometry(NamedTuple):
+    tracks:      int
+    heads:       int
+    sectors:     int
+    sector_size: int
+
+GEOMETRIES: dict[int, Geometry] = {
+    1440: Geometry(tracks=80, heads=2, sectors=18, sector_size= 512),
+    1232: Geometry(tracks=77, heads=2, sectors= 8, sector_size=1024),
+    1200: Geometry(tracks=80, heads=2, sectors=15, sector_size= 512),
+     720: Geometry(tracks=80, heads=2, sectors= 9, sector_size= 512),
+     640: Geometry(tracks=80, heads=2, sectors= 8, sector_size= 512),
+}
+
+class CbiResult(NamedTuple):
+    status: int
+    data:   bytes | None = None
+    sense:  bytes | None = None
+
+class Capacity(NamedTuple):
+    blocks:     int
+    block_size: int
+
+class FormatCapacitiesResult(NamedTuple):
+    capacity_list: list["Capacity"]
+    media_type:    int
+
+class InquiryResult(NamedTuple):
+    vendor:  str
+    product: str
+
+# ---------------------------------------------------------------------------
+# Verbosity
+# ---------------------------------------------------------------------------
+
+_verbose = 1  # 0=quiet  1=normal  2=-v  3=-vv
+
+
+def set_verbose(level: int) -> None:
+    global _verbose
+    _verbose = level
+
+
+def _vprint(level: int, msg: str, stderr: bool = False) -> None:
+    """Print msg if the current verbosity level is at least `level`."""
+    if _verbose >= level:
+        print(msg, file=sys.stderr if stderr else sys.stdout)
+
+
+def _should_vprint(level: int) -> bool:
+    """Return True if the current verbosity level is at least `level`."""
+    return _verbose >= level
+
+# ---------------------------------------------------------------------------
+# UFIDevice
+# ---------------------------------------------------------------------------
+
+class UFIDevice:
+    """Represents a single USB UFI floppy drive."""
+
+    def __init__(self, usb_dev, intf_num: int, ep_out, ep_in, ep_int):
+        self._dev      = usb_dev
+        self._intf_num = intf_num
+        self._ep_out   = ep_out
+        self._ep_in    = ep_in
+        self._ep_int   = ep_int
+        self._opened   = False
+        self._detached = False
+
+    # ------------------------------------------------------------------
+    # Discovery
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def find_all(cls) -> list["UFIDevice"]:
+        """Return all connected UFI floppy drives."""
+        found = []
+        for usb_dev in usb.core.find(find_all=True):
+            try:
+                cfg = usb_dev.get_active_configuration()
+            except usb.core.USBError:
+                continue
+            for intf in cfg:
+                if (intf.bInterfaceClass    == USB_CLASS_MASS_STORAGE and
+                        intf.bInterfaceSubClass == USB_SUBCLASS_UFI and
+                        intf.bInterfaceProtocol == USB_PROTOCOL_CBI):
+                    ep_out = ep_in = ep_int = None
+                    for ep in intf:
+                        ep_type = usb.util.endpoint_type(ep.bmAttributes)
+                        ep_dir  = usb.util.endpoint_direction(ep.bEndpointAddress)
+                        if ep_type == usb.util.ENDPOINT_TYPE_BULK:
+                            if ep_dir == usb.util.ENDPOINT_OUT:
+                                ep_out = ep
+                            else:
+                                ep_in  = ep
+                        elif ep_type == usb.util.ENDPOINT_TYPE_INTR:
+                            if ep_dir == usb.util.ENDPOINT_IN:
+                                ep_int = ep
+                    if ep_out and ep_in and ep_int:
+                        found.append(cls(usb_dev, intf.bInterfaceNumber,
+                                         ep_out, ep_in, ep_int))
+        return found
+
+    @classmethod
+    def find_by_location(cls, location: str) -> "UFIDevice | None":
+        """Return the device whose location string matches, or None.
+
+        location may be either a bus-ports string (e.g. '1-2.3') or,
+        when pyudev is available, a block-device path such as /dev/sdX or
+        /dev/sgX."""
+        devices = cls.find_all()
+
+        for dev in devices:
+            if _location_str(dev._dev) == location:
+                return dev
+
+        if not _PYUDEV_AVAILABLE:
+            return None
+
+        resolved = _block_dev_to_location(location)
+        if resolved is None:
+            return None
+
+        for dev in devices:
+            if _location_str(dev._dev) == resolved:
+                return dev
+
+        return None
+
+    # ------------------------------------------------------------------
+    # Open / close
+    # ------------------------------------------------------------------
+
+    def open(self) -> None:
+        if platform.system() == "Linux":
+            if self._dev.is_kernel_driver_active(self._intf_num):
+                self._dev.detach_kernel_driver(self._intf_num)
+                self._detached = True
+        usb.util.claim_interface(self._dev, self._intf_num)
+        self._opened = True
+
+    def close(self) -> None:
+        if not self._opened:
+            return
+        usb.util.release_interface(self._dev, self._intf_num)
+        if self._detached:
+            try:
+                self._dev.attach_kernel_driver(self._intf_num)
+            except usb.core.USBError:
+                pass
+        self._opened = False
+
+    def __enter__(self):
+        self.open()
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+    # ------------------------------------------------------------------
+    # CBI transport
+    #
+    # Three layers:
+    #   _cbi_transfer()    - one CONTROL -> BULK -> INTERRUPT sequence
+    #   _execute_command() - issues REQUEST SENSE on ISB error
+    #   _invoke()          - interprets sense data; handles TEST UNIT READY
+    #                        media-change retry and media-state codes
+    # ------------------------------------------------------------------
+
+    def _cbi_transfer(self, cdb: bytes, data_len: int, flags: int,
+                      data_out: bytes | None = None) -> CbiResult:
+        try:
+            self._dev.ctrl_transfer(
+                0x21,           # bmRequestType
+                0x00,           # bRequest: ADSC
+                0x0000,
+                self._intf_num,
+                cdb,
+                TIMEOUT_MS,
+            )
+        except usb.core.USBError as e:
+            _vprint(3, f"[UFI] CONTROL error: {e}", stderr=True)
+            return CbiResult(UFI_ERROR)
+
+        buf = None
+        if flags == CBW_FLAG_IN:
+            try:
+                buf = bytes(self._ep_in.read(data_len, TIMEOUT_MS))
+            except usb.core.USBError as e:
+                _vprint(3, f"[UFI] BULK IN error: {e}", stderr=True)
+                return CbiResult(UFI_ERROR)
+        elif data_out is not None:
+            try:
+                self._ep_out.write(data_out, TIMEOUT_MS)
+            except usb.core.USBError as e:
+                _vprint(3, f"[UFI] BULK OUT error: {e}", stderr=True)
+                return CbiResult(UFI_ERROR)
+
+        try:
+            isb = bytes(self._ep_int.read(2, TIMEOUT_MS))
+            asc, ascq = isb[0], isb[1]
+        except usb.core.USBError as e:
+            _vprint(3, f"[UFI] INTERRUPT error: {e}", stderr=True)
+            return CbiResult(UFI_ERROR)
+
+        if asc != 0x00:
+            _vprint(3, f"[UFI] ISB: ASC={asc:#04x} ASCQ={ascq:#04x}", stderr=True)
+
+        # For REQUEST SENSE itself, ignore interrupt errors
+        if cdb[0] != CDB_REQUEST_SENSE[0] and asc != 0x00:
+            return CbiResult(UFI_ERROR)
+
+        return CbiResult(UFI_GOOD, data=buf)
+
+    def _execute_command(self, cdb: bytes, data_len: int, flags: int,
+                         data_out: bytes | None = None) -> CbiResult:
+        r = self._cbi_transfer(cdb, data_len, flags, data_out)
+        if r.status == UFI_GOOD:
+            return r
+
+        sense_r = self._cbi_transfer(CDB_REQUEST_SENSE, _REQUEST_SENSE_DATA_LEN, CBW_FLAG_IN)
+        if sense_r.status != UFI_GOOD or sense_r.data is None:
+            _vprint(3, "[UFI] REQUEST SENSE failed", stderr=True)
+            return CbiResult(UFI_ERROR)
+
+        sense = sense_r.data
+        sk = sense[2] & 0x0f
+        _vprint(3, f"[UFI] SENSE key={sk:#04x} ASC={sense[12]:#04x} ASCQ={sense[13]:#04x}",
+                stderr=True)
+        for i in range(0, len(sense), 16):
+            _vprint(3, "  " + " ".join(f"{b:02x}" for b in sense[i:i+16]), stderr=True)
+
+        return CbiResult(UFI_ERROR, sense=sense)
+
+    def _invoke(self, cdb: bytes, data_len: int, flags: int,
+                data_out: bytes | None = None) -> CbiResult:
+        r = self._execute_command(cdb, data_len, flags, data_out)
+        if r.status == UFI_GOOD:
+            return r
+
+        if r.sense is None:
+            return CbiResult(UFI_ERROR)
+
+        sense_key = r.sense[2] & 0x0f
+        asc       = r.sense[12]
+        ascq      = r.sense[13]
+
+        if cdb[0] == CDB_TEST_UNIT_READY[0]:
+            if sense_key == 0x06 and asc == 0x28 and ascq == 0x00:
+                # media change - retry once
+                r = self._execute_command(cdb, data_len, flags, data_out)
+                if r.status == UFI_GOOD:
+                    return r
+                if r.sense is None:
+                    return CbiResult(UFI_ERROR)
+                sense_key = r.sense[2] & 0x0f
+                asc       = r.sense[12]
+                ascq      = r.sense[13]
+            if sense_key == 0x03 and asc == 0x30 and ascq == 0x01:
+                return CbiResult(UFI_UNFORMATTED_MEDIA)
+            if sense_key == 0x02 and asc == 0x3a and ascq == 0x00:
+                return CbiResult(UFI_NO_MEDIA)
+
+        _vprint(3, f"[UFI] command error: opcode={cdb[0]:#04x} sense_key={sense_key:#04x}",
+                stderr=True)
+        return CbiResult(UFI_ERROR)
+
+    # ------------------------------------------------------------------
+    # UFI commands
+    # ------------------------------------------------------------------
+
+    def test_unit_ready(self) -> int:
+        """Returns UFI_FORMATTED_MEDIA, UFI_UNFORMATTED_MEDIA, UFI_NO_MEDIA, or UFI_ERROR."""
+        r = self._invoke(CDB_TEST_UNIT_READY, 0, CBW_FLAG_OUT)
+        return UFI_FORMATTED_MEDIA if r.status == UFI_GOOD else r.status
+
+    def read_format_capacities(self) -> FormatCapacitiesResult:
+        r = self._invoke(CDB_READ_FORMAT_CAPACITIES, _READ_FORMAT_CAPACITIES_DATA_LEN, CBW_FLAG_IN)
+        if r.status != UFI_GOOD:
+            raise IOError("READ FORMAT CAPACITIES failed")
+
+        data         = r.data
+        cap_list_len = data[3]
+        media_type   = data[4 + 4] & 0x03
+
+        capacity_list = []
+        for i in range(0, cap_list_len, 8):
+            blocks     = int.from_bytes(data[4 + i     : 4 + i + 4], 'big')
+            block_size = int.from_bytes(data[4 + i + 5 : 4 + i + 8], 'big')
+            capacity_list.append(Capacity(blocks=blocks, block_size=block_size))
+
+        return FormatCapacitiesResult(capacity_list=capacity_list, media_type=media_type)
+
+    def inquiry(self) -> InquiryResult:
+        r = self._invoke(CDB_INQUIRY, _INQUIRY_DATA_LEN, CBW_FLAG_IN)
+        if r.status != UFI_GOOD:
+            raise IOError("INQUIRY failed")
+        data    = r.data
+        vendor  = data[8:16].rstrip(b' ').decode('ascii', errors='replace')
+        product = data[16:32].rstrip(b' ').decode('ascii', errors='replace')
+        return InquiryResult(vendor=vendor, product=product)
+
+    def mode_sense(self) -> int:
+        """Returns UFI_PROTECTED or UFI_NOT_PROTECTED."""
+        r = self._invoke(CDB_MODE_SENSE, _MODE_SENSE_DATA_LEN, CBW_FLAG_IN)
+        if r.status != UFI_GOOD:
+            raise IOError("MODE SENSE failed")
+        return UFI_PROTECTED if (r.data[3] & 0x80) else UFI_NOT_PROTECTED
+
+    def format_unit(self, blocks: int, block_size: int, track: int, head: int) -> int:
+        """Format a single track/head. Returns UFI_GOOD or UFI_ERROR."""
+        cdb  = bytearray(CDB_FORMAT_UNIT_BASE)
+        data = bytearray(FORMAT_UNIT_DATA_BASE)
+
+        cdb[2]     = track
+        data[1]   |= head
+        data[4:8]  = blocks.to_bytes(4, 'big')
+        data[9:12] = block_size.to_bytes(3, 'big')
+
+        r = self._invoke(bytes(cdb), len(data), CBW_FLAG_OUT, bytes(data))
+        return r.status
+
+    def read10(self, lba: int, sectors: int, block_size: int) -> CbiResult:
+        """Read sectors starting at lba via READ(10)."""
+        cdb = bytearray(CDB_READ10_BASE)
+        cdb[2:6] = lba.to_bytes(4, 'big')
+        cdb[7:9] = sectors.to_bytes(2, 'big')
+        return self._invoke(bytes(cdb), sectors * block_size, CBW_FLAG_IN)
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _location_str(usb_dev) -> str:
+    """Return a bus/port path string such as '1-2.3'."""
+    bus   = usb_dev.bus
+    ports = usb_dev.port_numbers
+    if ports:
+        return f"{bus}-{'.'.join(str(p) for p in ports)}"
+    return f"{bus}-?"
+
+
+# ---------------------------------------------------------------------------
+# pyudev helpers  (only used when _PYUDEV_AVAILABLE is True)
+# ---------------------------------------------------------------------------
+
+def _block_dev_to_location(path: str) -> str | None:
+    """Resolve a block-device path to a bus-port location string."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+
+    if not _stat.S_ISBLK(st.st_mode) and not _stat.S_ISCHR(st.st_mode):
+        return None
+
+    ctx = pyudev.Context()
+
+    try:
+        udev_dev = pyudev.Devices.from_device_file(ctx, path)
+    except (pyudev.DeviceNotFoundError, ValueError):
+        udev_dev = None
+
+    if udev_dev is None:
+        return None
+
+    # Walk up the parent chain to find the USB device
+    parent = udev_dev.find_parent(subsystem="usb", device_type="usb_device")
+    if parent is None:
+        return None
+
+    # sys_path is like /sys/devices/pci.../usb1/1-2/1-2.3
+    # The last path component is the USB location string we want.
+    sys_name = parent.sys_name  # e.g. '1-2.3'
+    if not sys_name:
+        return None
+
+    return sys_name
+
+
+def _location_to_block_devs(location: str) -> list[str]:
+    """Return block/sg device names associated with location."""
+    ctx = pyudev.Context()
+
+    # Find the USB device node matching the location (sys_name == location)
+    usb_dev = None
+    for d in ctx.list_devices(subsystem="usb", DEVTYPE="usb_device"):
+        if d.sys_name == location:
+            usb_dev = d
+            break
+
+    if usb_dev is None:
+        return []
+
+    names: list[str] = []
+    # Collect all descendants that are block or scsi_generic devices
+    for child in ctx.list_devices():
+        # child must be a descendant of usb_dev
+        parent = child.find_parent(subsystem="usb", device_type="usb_device")
+        if parent is None or parent.sys_name != location:
+            continue
+        if child.subsystem == "block" and child.device_type == "disk":
+            node = child.device_node
+            if node:
+                names.append(os.path.basename(node))
+        elif child.subsystem == "scsi_generic":
+            node = child.device_node
+            if node:
+                names.append(os.path.basename(node))
+
+    names.sort()
+    return names
+
+
+def _die(msg: str) -> None:
+    _vprint(0, f"error: {msg}", stderr=True)
+    sys.exit(1)
+
+
+def _show_capacity(label: str, cap: Capacity) -> None:
+    kb = cap.blocks * cap.block_size // 1024
+    _vprint(0, f"{label:<12} {cap.blocks:5d} {cap.block_size:4d} {kb:4d}")
+
+# ---------------------------------------------------------------------------
+# High-level operations
+# ---------------------------------------------------------------------------
+
+def list_devices() -> None:
+    devices = UFIDevice.find_all()
+    if not devices:
+        _vprint(1, "(no UFI floppy drives found)")
+        return
+
+    show_devs = _PYUDEV_AVAILABLE
+
+    if _should_vprint(2):
+        if show_devs:
+            _vprint(2, f"{'location':<12}  {'devices':<10}  {'VID':<6}  {'PID':<6}  {'vendor':<10}  product")
+        else:
+            _vprint(2, f"{'location':<12}  {'VID':<6}  {'PID':<6}  {'vendor':<10}  product")
+    else:
+        if show_devs:
+            _vprint(1, f"{'location':<12}  {'devices':<10}  {'VID':<6}  {'PID':<6}")
+        else:
+            _vprint(1, f"{'location':<12}  {'VID':<6}  {'PID':<6}")
+
+    for dev in devices:
+        info     = dev._dev
+        location = _location_str(info)
+        vid      = f"{info.idVendor:#06x}"
+        pid      = f"{info.idProduct:#06x}"
+        devs_str = ", ".join(_location_to_block_devs(location)) if show_devs else ""
+
+        if _should_vprint(2):
+            try:
+                with dev:
+                    prod = dev.inquiry()
+                vendor  = prod.vendor
+                product = prod.product
+            except Exception:
+                vendor = product = "?"
+            if show_devs:
+                _vprint(2, f"{location:<12}  {devs_str:<10}  {vid:<6}  {pid:<6}  {vendor:<10}  {product}")
+            else:
+                _vprint(2, f"{location:<12}  {vid:<6}  {pid:<6}  {vendor:<10}  {product}")
+        else:
+            if show_devs:
+                _vprint(0, f"{location:<12}  {devs_str:<10}  {vid:<6}  {pid:<6}")
+            else:
+                _vprint(0, f"{location:<12}  {vid:<6}  {pid:<6}")
+
+
+def inquire(location: str, force: bool = False) -> None:
+    dev = UFIDevice.find_by_location(location)
+    if dev is None:
+        _die(f"no device found at {location}")
+
+    with dev:
+        media_type = dev.test_unit_ready()
+        if media_type == UFI_ERROR and not force:
+            _die(f"{location}: TEST UNIT READY failed")
+
+        result     = dev.read_format_capacities()
+        cap_list   = result.capacity_list
+        media_type = result.media_type
+
+        wp = UFI_NOT_PROTECTED
+        if media_type in (UFI_UNFORMATTED_MEDIA, UFI_FORMATTED_MEDIA):
+            wp = dev.mode_sense()
+
+        prod = dev.inquiry()
+
+        _vprint(2, f"vendor:  {prod.vendor}")
+        _vprint(2, f"product: {prod.product}")
+        if media_type in (UFI_UNFORMATTED_MEDIA, UFI_FORMATTED_MEDIA):
+            _vprint(2, f"write protect: {'on' if wp == UFI_PROTECTED else 'off'}")
+            kb0 = cap_list[0].blocks * cap_list[0].block_size // 1024
+            _vprint(2, f"media type: {'2HD' if kb0 > 1024 else '2DD'}")
+        _vprint(1, f"{'status':<12} {'block':>5} {'size':>4} {'kb':>4}")
+
+        if not cap_list:
+            _vprint(1, "(no capacity data returned)")
+            return
+
+        if media_type == UFI_UNFORMATTED_MEDIA:
+            _show_capacity("unformatted", cap_list[0])
+        elif media_type == UFI_FORMATTED_MEDIA:
+            _show_capacity("formatted",   cap_list[0])
+            for cap in cap_list[1:]:
+                _show_capacity("formattable", cap)
+        else:
+            _show_capacity("no_media",    cap_list[0])
+
+
+def format_disk(location: str, size_kb: int = 0, verify: bool = False,
+                force: bool = False) -> None:
+    dev = UFIDevice.find_by_location(location)
+    if dev is None:
+        _die(f"no device found at {location}")
+
+    with dev:
+        if not force:
+            media_type = dev.test_unit_ready()
+            if media_type == UFI_ERROR:
+                _die(f"{location}: TEST UNIT READY failed")
+            if media_type == UFI_NO_MEDIA:
+                _die(f"{location}: no media")
+            wp = dev.mode_sense()
+            if wp == UFI_PROTECTED:
+                _die(f"{location}: write protected")
+
+        result     = dev.read_format_capacities()
+        cap_list   = result.capacity_list
+        media_type = result.media_type
+
+        if not cap_list:
+            _die("could not read format capacities")
+
+        current_cap = cap_list[0]
+
+        if size_kb == 0:
+            # Use the geometry of the currently formatted disk
+            size_kb = current_cap.blocks * current_cap.block_size // 1024
+            geo = GEOMETRIES.get(size_kb)
+            if geo is None or geo.sector_size != current_cap.block_size:
+                _die("unable to determine geometry for the current media")
+        else:
+            geo = GEOMETRIES.get(size_kb)
+            if geo is None:
+                _die(f"unsupported format size {size_kb} KB "
+                     f"(supported: {sorted(GEOMETRIES)})")
+
+        if not force:
+            # The requested size must appear in the formattable capacity list
+            formattable_sizes = {
+                cap.blocks * cap.block_size // 1024
+                for cap in cap_list[1:]
+            }
+            if size_kb not in formattable_sizes:
+                _die(f"{location}: {size_kb} KB is not in the formattable capacity list")
+
+            # Media type must match (2HD vs 2DD)
+            current_kb = current_cap.blocks * current_cap.block_size // 1024
+            if (size_kb > 1024) != (current_kb > 1024):
+                _die(f"{location}: media type mismatch")
+
+        tracks, heads, sectors, block_size = geo
+        total_blocks = tracks * heads * sectors
+
+        _vprint(2, f"geometry: track={tracks}, head={heads}, "
+                f"sector={sectors}, block={block_size}")
+
+        for t in range(tracks):
+            for h in range(heads):
+                if _should_vprint(1):
+                    print(f"formatting track={t:02d}, head={h}\r", end='', flush=True)
+                if dev.format_unit(total_blocks, block_size, t, h) != UFI_GOOD:
+                    _die(f"format_unit failed at track={t}, head={h}")
+
+        if verify:
+            expected_byte: int | None = None
+            for t in range(tracks):
+                for h in range(heads):
+                    if _should_vprint(1):
+                        print(f"verifying  track={t:02d}, head={h}\r", end='', flush=True)
+                    lba = (t * heads + h) * sectors
+                    r   = dev.read10(lba, sectors, block_size)
+                    if r.status != UFI_GOOD:
+                        _die(f"read failed at track={t}, head={h}")
+                    if expected_byte is None:
+                        expected_byte = r.data[0]
+                    if any(b != expected_byte for b in r.data):
+                        _die(f"verify mismatch at track={t}, head={h}")
+
+    _vprint(1, "done" + " " * 30)
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog="ufifmt",
+        description="Format a floppy disk in a USB UFI floppy drive.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+macOS: eject the disk in Finder (or: diskutil eject /dev/diskN) before running.
+Linux: run as root, or add a udev rule for the device.""")
+
+    location_eg = "1-2.3, /dev/sdb, /dev/sg1" if _PYUDEV_AVAILABLE else "1-2.3"
+    parser.add_argument("location", nargs="?", metavar="LOCATION",
+                        help=f"device location (e.g. {location_eg}); "
+                             "omit with -i to list all devices")
+    parser.add_argument("-i", "--inquire", action="store_true",
+                        help="show device information instead of formatting; "
+                             "omit LOCATION to list all devices")
+    parser.add_argument("-f", "--format",  type=int, metavar="KB", default=0,
+                        help="format size in KB (default: use current media size)")
+    parser.add_argument("-V", "--verify",  action="store_true",
+                        help="verify after formatting")
+    parser.add_argument("-F", "--force",   action="store_true",
+                        help="skip safety checks")
+    parser.add_argument("-v", "--verbose", action="count", default=0,
+                        help="increase verbosity (-v or -vv)")
+    parser.add_argument("-q", "--quiet",   action="store_true",
+                        help="suppress all non-error output")
+    parser.add_argument("--version", action="version",
+                        version=f"%(prog)s {__version__}")
+
+    args = parser.parse_args()
+
+    # verbose level: 0=quiet  1=normal  2=-v  3=-vv
+    verbose = 0 if args.quiet else 1 + args.verbose
+    set_verbose(verbose)
+
+    if args.inquire and args.format:
+        parser.error("options -i/--inquire and -f/--format are mutually exclusive")
+
+    if args.inquire:
+        if args.location is None:
+            list_devices()
+        else:
+            inquire(args.location, force=args.force)
+        return
+
+    if args.location is None:
+        parser.error("LOCATION is required for formatting")
+
+    format_disk(args.location,
+                size_kb=args.format,
+                verify=args.verify,
+                force=args.force)
+
+
+if __name__ == "__main__":
+    main()
