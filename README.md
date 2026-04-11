@@ -38,7 +38,7 @@ pip install pyudev
 ## Usage
 
 ```
-usage: ufiformat [-h] [-i] [-f KB] [-V] [-F] [-v] [-q] [--version] [LOCATION]
+usage: ufifmt [-h] [-i] [-f KB] [-V] [-F] [-v] [-q] [--version] [LOCATION]
 
 Format a floppy disk in a USB UFI floppy drive.
 
