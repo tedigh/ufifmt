@@ -16,6 +16,16 @@ originally written in C.
 
 ## Installation
 
+### ufifmt
+
+```sh
+git clone https://github.com/tedigh/ufifmt.git
+cd ufifmt
+sudo install -m 755 -D -t /usr/bin/ ufifmt
+```
+
+Or download a ZIP from GitHub and extract it, then run the `install` command above from the extracted directory.
+
 ### libusb
 
 ```sh
@@ -99,7 +109,8 @@ SUBSYSTEM=="usb", ATTR{idVendor}=="YOUR_VID", ATTR{idProduct}=="YOUR_PID", MODE=
 Run `ufifmt -i` to find the VID/PID of your drive, then reload rules:
 
 ```sh
-sudo udevadm control --reload-rules && sudo udevadm trigger
+sudo udevadm control --reload-rules
+sudo udevadm trigger
 ```
 
 Installing pyudev and libudev enables device path arguments such as `/dev/sdb`
