@@ -29,11 +29,11 @@ Or download a ZIP from GitHub and extract it, then run the `install` command abo
 ### libusb
 
 ```sh
-# macOS
-brew install libusb
-
 # Debian / Ubuntu
 sudo apt install libusb-1.0-0
+
+# macOS
+brew install libusb
 ```
 
 ### Python dependencies
